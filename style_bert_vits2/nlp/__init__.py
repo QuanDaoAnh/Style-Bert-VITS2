@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 from numpy.typing import NDArray
 
@@ -13,11 +13,7 @@ from style_bert_vits2.nlp.symbols import (
     SYMBOLS,
 )
 
-
-# __init__.py は配下のモジュールをインポートした時点で実行される
-# PyTorch のインポートは重いので、型チェック時以外はインポートしない
-if TYPE_CHECKING:
-    import torch
+import torch
 
 
 __symbol_to_id = {s: i for i, s in enumerate(SYMBOLS)}
