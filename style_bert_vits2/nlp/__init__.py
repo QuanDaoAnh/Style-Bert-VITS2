@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 from numpy.typing import NDArray
 
 from style_bert_vits2.constants import Languages
+from style_bert_vits2.nlp import bert_models
+from style_bert_vits2.nlp.japanese.g2p import text_to_sep_kata
 from style_bert_vits2.nlp.symbols import (
     LANGUAGE_ID_MAP,
     LANGUAGE_TONE_START_MAP,
@@ -45,15 +47,40 @@ def extract_bert_feature(
     """
 
     if language == Languages.JP:
-        from style_bert_vits2.nlp.japanese.bert_feature import extract_bert_feature
-    elif language == Languages.EN:
-        from style_bert_vits2.nlp.english.bert_feature import extract_bert_feature
-    elif language == Languages.ZH:
-        from style_bert_vits2.nlp.chinese.bert_feature import extract_bert_feature
-    else:
-        raise ValueError(f"Language {language} not supported")
+        text = "".join(text_to_sep_kata(text, raise_yomi_error=False)[0])
+        if assist_text:
+            assist_text = "".join(text_to_sep_kata(assist_text, raise_yomi_error=False)[0])
 
-    return extract_bert_feature(text, word2ph, device, assist_text, assist_text_weight)
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+    model = bert_models.load_model(language, device_map=device)
+    bert_models.transfer_model(language, device)
+
+    style_res_mean = None
+    with torch.no_grad():
+        tokenizer = bert_models.load_tokenizer(language)
+        inputs = tokenizer(text, return_tensors="pt")
+        for i in inputs:
+            inputs[i] = inputs[i].to(device)  # type: ignore
+        res = model(**inputs, output_hidden_states=True)
+        res = torch.cat(res["hidden_states"][-3:-2], -1)[0]
+        if assist_text:
+            style_inputs = tokenizer(assist_text, return_tensors="pt")
+            for i in style_inputs:
+                style_inputs[i] = style_inputs[i].to(device)  # type: ignore
+            style_res = model(**style_inputs, output_hidden_states=True)
+            style_res = torch.cat(style_res["hidden_states"][-3:-2], -1)[0]
+            style_res_mean = style_res.mean(0)
+
+    assert len(word2ph) == len(text) + 2, text
+    word2phone = torch.LongTensor(word2ph).to(device)
+    if assist_text:
+        assert style_res_mean is not None
+        repeat_feature = res * (1 - assist_text_weight) + style_res_mean * assist_text_weight
+    else:
+        repeat_feature = res
+    phone_level_feature = torch.repeat_interleave(repeat_feature, word2phone, 0)
+    return phone_level_feature.T
 
 
 def extract_bert_feature_onnx(
