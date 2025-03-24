@@ -272,6 +272,26 @@ class TTSModel:
         style_vec = mean + (style_vec - mean) * weight
         return style_vec
 
+    def get_style_vector_mix(self, style_ids: list[int], style_weights: list[float]) -> NDArray[Any]:
+        """
+        スタイルベクトルを取得する。
+        Args:
+            style_id (int): スタイル ID (0 から始まるインデックス)
+            weight (float, optional): スタイルベクトルの重み. Defaults to 1.0.
+        Returns:
+            NDArray[Any]: スタイルベクトル
+        """
+        style_vec = None
+        for i, style_id in enumerate(style_ids):
+            style_data = self.style_vectors[style_id] * style_weights[i]
+            if style_vec is None:
+                style_vec = style_data
+            else:
+                style_vec += style_data
+        if style_vec is None:
+            raise ValueError("Empty style")
+        return style_vec
+    
     def get_style_vector_from_audio(
         self, audio_path: str, weight: float = 1.0
     ) -> NDArray[Any]:
@@ -370,6 +390,8 @@ class TTSModel:
         use_assist_text: bool = False,
         style: str = DEFAULT_STYLE,
         style_weight: float = DEFAULT_STYLE_WEIGHT,
+        styles: list[str] = [],
+        style_weights: list[float] = [],
         given_phone: Optional[list[str]] = None,
         given_tone: Optional[list[int]] = None,
         pitch_scale: float = 1.0,
@@ -396,6 +418,8 @@ class TTSModel:
             use_assist_text (bool, optional): 音声合成時に感情表現の補助テキストを使用するかどうか. Defaults to False.
             style (str, optional): 音声スタイル (Neutral, Happy など). Defaults to DEFAULT_STYLE.
             style_weight (float, optional): 音声スタイルを適用する強さ. Defaults to DEFAULT_STYLE_WEIGHT.
+            styles (list[str], optional): List styles
+            style_weights (list[float], optional): List weights with same order as styles
             given_phone (Optional[list[int]], optional): 読み上げテキストの読みを表す音素列。指定する場合は given_tone も別途指定が必要. Defaults to None.
             given_tone (Optional[list[int]], optional): アクセントのトーンのリスト. Defaults to None.
             pitch_scale (float, optional): ピッチの高さ (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
@@ -417,9 +441,15 @@ class TTSModel:
             assist_text = None
 
         # スタイルベクトルを取得
+        if len(styles) != len(style_weights):
+            raise ValueError("styles and style_weights must have the same length")
         if reference_audio_path is None:
-            style_id = self.style2id[style]
-            style_vector = self.get_style_vector(style_id, style_weight)
+            if len(styles) == 0:
+                style_id = self.style2id[style]
+                style_vector = self.get_style_vector(style_id, style_weight)
+            else:
+                style_ids = [self.style2id[style_name] for style_name in styles]
+                style_vector = self.get_style_vector_mix(style_ids, style_weights)
         else:
             style_vector = self.get_style_vector_from_audio(
                 reference_audio_path, style_weight
