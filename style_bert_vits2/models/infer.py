@@ -2,6 +2,7 @@ from typing import Any, Optional, Union, cast
 
 import torch
 from numpy.typing import NDArray
+import numpy as np
 
 from style_bert_vits2.constants import Languages
 from style_bert_vits2.logging import logger
@@ -15,10 +16,13 @@ from style_bert_vits2.nlp import (
     clean_text_with_given_phone_tone,
     cleaned_text_to_sequence,
     extract_bert_feature,
+    clean_text_with_given_phone_tone_triton, 
+    extract_bert_feature_triton
 )
 from style_bert_vits2.nlp.symbols import SYMBOLS
 from torch.overrides import TorchFunctionMode
 
+from style_bert_vits2.triton.client import call_tts_triton
 
 class EmptyInitOnDevice(TorchFunctionMode):
     def __init__(self, device=None): # type: ignore
@@ -285,5 +289,148 @@ def infer(
         )  # , emo
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        return audio
+
+def get_text_triton(
+    text: str,
+    language_str: Languages,
+    hps: HyperParameters,
+    assist_text: Optional[str] = None,
+    assist_text_weight: float = 0.7,
+    given_phone: Optional[list[str]] = None,
+    given_tone: Optional[list[int]] = None,
+) -> tuple[
+    NDArray[Any], NDArray[Any], NDArray[Any], list[Any], list[Any], list[Any]
+]:
+    use_jp_extra = hps.version.endswith("JP-Extra")
+    norm_text, phone, tone, word2ph = clean_text_with_given_phone_tone_triton(
+        text,
+        language_str,
+        given_phone=given_phone,
+        given_tone=given_tone,
+        use_jp_extra=use_jp_extra,
+        raise_yomi_error=False,
+    )
+    phone, tone, language = cleaned_text_to_sequence(phone, tone, language_str)
+
+    if hps.data.add_blank:
+        phone = commons.intersperse(phone, 0)
+        tone = commons.intersperse(tone, 0)
+        language = commons.intersperse(language, 0)
+        for i in range(len(word2ph)):
+            word2ph[i] = word2ph[i] * 2
+        word2ph[0] += 1
+    bert_ori = extract_bert_feature_triton(
+        norm_text,
+        word2ph,
+        language_str,
+        assist_text,
+        assist_text_weight,
+    )
+    del word2ph
+    assert bert_ori.shape[-1] == len(phone), phone
+
+    if language_str == Languages.ZH:
+        bert = bert_ori
+        ja_bert = np.zeros((1024, len(phone)))
+        en_bert = np.zeros((1024, len(phone)))
+    elif language_str == Languages.JP:
+        bert = np.zeros((1024, len(phone)))
+        ja_bert = bert_ori
+        en_bert = np.zeros((1024, len(phone)))
+    elif language_str == Languages.EN:
+        bert = np.zeros((1024, len(phone)))
+        ja_bert = np.zeros((1024, len(phone)))
+        en_bert = bert_ori
+    else:
+        raise ValueError("language_str should be ZH, JP or EN")
+
+    assert bert.shape[-1] == len(
+        phone
+    ), f"Bert seq len {bert.shape[-1]} != {len(phone)}"
+    return bert, ja_bert, en_bert, phone, tone, language
+
+def infer_triton(
+    text: str,
+    style_vec: NDArray[Any],
+    sdp_ratio: float,
+    noise_scale: float,
+    noise_scale_w: float,
+    length_scale: float,
+    sid: int,
+    language: Languages,
+    hps: HyperParameters,
+    skip_start: bool = False,
+    skip_end: bool = False,
+    assist_text: Optional[str] = None,
+    assist_text_weight: float = 0.7,
+    given_phone: Optional[list[str]] = None,
+    given_tone: Optional[list[int]] = None,
+) -> NDArray[Any]:
+    is_jp_extra = hps.version.endswith("JP-Extra")
+    bert, ja_bert, en_bert, phones, tones, lang_ids = get_text_triton(
+        text,
+        language,
+        hps,
+        assist_text=assist_text,
+        assist_text_weight=assist_text_weight,
+        given_phone=given_phone,
+        given_tone=given_tone,
+    )
+    if skip_start:
+        phones = phones[3:]
+        tones = tones[3:]
+        lang_ids = lang_ids[3:]
+        bert = bert[:, 3:]
+        ja_bert = ja_bert[:, 3:]
+        en_bert = en_bert[:, 3:]
+    if skip_end:
+        phones = phones[:-2]
+        tones = tones[:-2]
+        lang_ids = lang_ids[:-2]
+        bert = bert[:, :-2]
+        ja_bert = ja_bert[:, :-2]
+        en_bert = en_bert[:, :-2]
+
+    with torch.no_grad():
+        x_tst = np.array([phones])
+        tones = np.array([tones])
+        lang_ids = np.array([lang_ids])
+        bert = np.array([bert], np.float32)
+        ja_bert = np.array([ja_bert], np.float32)
+        en_bert = np.array([en_bert], np.float32)
+        x_tst_lengths = np.array([len(phones)])
+        style_vec = np.array([style_vec])
+        del phones
+        audio = call_tts_triton(
+            hps.model_name,
+            x_tst,
+            x_tst_lengths,
+            sid,
+            tones,
+            lang_ids,
+            bert,
+            ja_bert,
+            en_bert,
+            style_vec=style_vec,
+            length_scale=length_scale,
+            sdp_ratio=sdp_ratio,
+            noise_scale=noise_scale,
+            noise_scale_w=noise_scale_w,
+            is_jp_extra=is_jp_extra
+        )
+
+        del (
+            x_tst,
+            tones,
+            lang_ids,
+            bert,
+            x_tst_lengths,
+            sid,
+            ja_bert,
+            en_bert,
+            style_vec,
+        )  # , emo
 
         return audio

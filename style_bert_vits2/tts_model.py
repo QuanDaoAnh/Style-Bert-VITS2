@@ -25,6 +25,7 @@ from style_bert_vits2.constants import (
 from style_bert_vits2.logging import logger
 from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.voice import adjust_voice
+from style_bert_vits2.models.infer import infer_triton
 
 
 if TYPE_CHECKING:
@@ -597,6 +598,297 @@ class TTSModel:
         audio = self.convert_to_16_bit_wav(audio)
         return (self.hyper_parameters.data.sampling_rate, audio)
 
+class TTSModelTriton:
+    def __init__(
+        self,
+        config_path: Union[Path, HyperParameters],
+        style_vec_path: Union[Path, NDArray[Any]]
+    ):
+        if isinstance(style_vec_path, np.ndarray):
+            self.style_vec_path: Path = Path("")  # 互換性のため空の Path を設定
+            self.style_vectors: NDArray[Any] = style_vec_path
+        # スタイルベクトルのパスが指定された
+        else:
+            self.style_vec_path: Path = style_vec_path
+            self.style_vectors: NDArray[Any] = np.load(self.style_vec_path)
+
+        # ハイパーパラメータの Pydantic モデルが直接指定された
+        if isinstance(config_path, HyperParameters):
+            self.config_path: Path = Path("")  # 互換性のため空の Path を設定
+            self.hyper_parameters: HyperParameters = config_path
+        # ハイパーパラメータのパスが指定された
+        else:
+            self.config_path: Path = config_path
+            self.hyper_parameters: HyperParameters = HyperParameters.load_from_json(
+                self.config_path
+            )
+
+        num_styles: int = self.hyper_parameters.data.num_styles
+        if hasattr(self.hyper_parameters.data, "style2id"):
+            self.style2id: dict[str, int] = self.hyper_parameters.data.style2id
+        else:
+            self.style2id: dict[str, int] = {str(i): i for i in range(num_styles)}
+        if len(self.style2id) != num_styles:
+            raise ValueError(
+                f"Number of styles ({num_styles}) does not match the number of style2id ({len(self.style2id)})"
+            )
+    
+    def get_style_vector(self, style_id: int, weight: float = 1.0) -> NDArray[Any]:
+        """
+        スタイルベクトルを取得する。
+
+        Args:
+            style_id (int): スタイル ID (0 から始まるインデックス)
+            weight (float, optional): スタイルベクトルの重み. Defaults to 1.0.
+
+        Returns:
+            NDArray[Any]: スタイルベクトル
+        """
+        mean = self.style_vectors[0]
+        style_vec = self.style_vectors[style_id]
+        style_vec = mean + (style_vec - mean) * weight
+        return style_vec
+
+    def get_style_vector_mix(self, style_ids: list[int], style_weights: list[float]) -> NDArray[Any]:
+        """
+        スタイルベクトルを取得する。
+        Args:
+            style_id (int): スタイル ID (0 から始まるインデックス)
+            weight (float, optional): スタイルベクトルの重み. Defaults to 1.0.
+        Returns:
+            NDArray[Any]: スタイルベクトル
+        """
+        style_vec = None
+        for i, style_id in enumerate(style_ids):
+            style_data = self.style_vectors[style_id] * style_weights[i]
+            if style_vec is None:
+                style_vec = style_data
+            else:
+                style_vec += style_data
+        if style_vec is None:
+            raise ValueError("Empty style")
+        return style_vec
+    
+    def get_style_vector_from_audio(
+        self, audio_path: str, weight: float = 1.0
+    ) -> NDArray[Any]:
+        """
+        音声からスタイルベクトルを推論する。
+
+        Args:
+            audio_path (str): 音声ファイルのパス
+            weight (float, optional): スタイルベクトルの重み. Defaults to 1.0.
+        Returns:
+            NDArray[Any]: スタイルベクトル
+        """
+
+        if self.style_vector_inference is None:
+
+            # pyannote.audio は scikit-learn などの大量の重量級ライブラリに依存しているため、
+            # TTSModel.infer() に reference_audio_path を指定し音声からスタイルベクトルを推論する場合のみ遅延 import する
+            try:
+                import pyannote.audio
+            except ImportError:
+                raise ImportError(
+                    "pyannote.audio is required to infer style vector from audio"
+                )
+
+            # スタイルベクトルを取得するための推論モデルを初期化
+            import torch
+
+            self.style_vector_inference = pyannote.audio.Inference(
+                model=pyannote.audio.Model.from_pretrained(
+                    "pyannote/wespeaker-voxceleb-resnet34-LM"
+                ),
+                window="whole",
+            )
+            self.style_vector_inference.to(torch.device('cuda'))
+
+        # 音声からスタイルベクトルを推論
+        xvec = self.style_vector_inference(audio_path)
+        mean = self.style_vectors[0]
+        xvec = mean + (xvec - mean) * weight
+        return xvec
+
+    @staticmethod
+    def convert_to_16_bit_wav(data: NDArray[Any]) -> NDArray[Any]:
+        """
+        音声データを 16-bit int 形式に変換する。
+        gradio.processing_utils.convert_to_16_bit_wav() を移植したもの。
+
+        Args:
+            data (NDArray[Any]): 音声データ
+
+        Returns:
+            NDArray[Any]: 16-bit int 形式の音声データ
+        """
+
+        # Based on: https://docs.scipy.org/doc/scipy/reference/generated/scipy.io.wavfile.write.html
+        if data.dtype in [np.float64, np.float32, np.float16]:  # type: ignore
+            data = data / np.abs(data).max()
+            data = data * 32767
+            data = data.astype(np.int16)
+        elif data.dtype == np.int32:
+            data = data / 65536
+            data = data.astype(np.int16)
+        elif data.dtype == np.int16:
+            pass
+        elif data.dtype == np.uint16:
+            data = data - 32768
+            data = data.astype(np.int16)
+        elif data.dtype == np.uint8:
+            data = data * 257 - 32768
+            data = data.astype(np.int16)
+        elif data.dtype == np.int8:
+            data = data * 256
+            data = data.astype(np.int16)
+        else:
+            raise ValueError(
+                "Audio data cannot be converted automatically from "
+                f"{data.dtype} to 16-bit int format."
+            )
+
+        return data
+    
+    def infer(
+        self,
+        text: str,
+        language: Languages = Languages.JP,
+        speaker_id: int = 0,
+        reference_audio_path: Optional[str] = None,
+        sdp_ratio: float = DEFAULT_SDP_RATIO,
+        noise: float = DEFAULT_NOISE,
+        noise_w: float = DEFAULT_NOISEW,
+        length: float = DEFAULT_LENGTH,
+        line_split: bool = DEFAULT_LINE_SPLIT,
+        split_interval: float = DEFAULT_SPLIT_INTERVAL,
+        assist_text: Optional[str] = None,
+        assist_text_weight: float = DEFAULT_ASSIST_TEXT_WEIGHT,
+        use_assist_text: bool = False,
+        style: str = DEFAULT_STYLE,
+        style_weight: float = DEFAULT_STYLE_WEIGHT,
+        styles: list[str] = [],
+        style_weights: list[float] = [],
+        given_phone: Optional[list[str]] = None,
+        given_tone: Optional[list[int]] = None,
+        pitch_scale: float = 1.0,
+        intonation_scale: float = 1.0,
+    ) -> tuple[int, NDArray[Any]]:
+        """
+        テキストから音声を合成する。
+
+        Args:
+            text (str): 読み上げるテキスト
+            language (Languages, optional): 言語. Defaults to Languages.JP.
+            speaker_id (int, optional): 話者 ID. Defaults to 0.
+            reference_audio_path (Optional[str], optional): 音声スタイルの参照元の音声ファイルのパス. Defaults to None.
+            sdp_ratio (float, optional): DP と SDP の混合比。0 で DP のみ、1で SDP のみを使用 (値を大きくするとテンポに緩急がつく). Defaults to DEFAULT_SDP_RATIO.
+            noise (float, optional): DP に与えられるノイズ. Defaults to DEFAULT_NOISE.
+            noise_w (float, optional): SDP に与えられるノイズ. Defaults to DEFAULT_NOISEW.
+            length (float, optional): 生成音声の長さ（話速）のパラメータ。大きいほど生成音声が長くゆっくり、小さいほど短く早くなる。 Defaults to DEFAULT_LENGTH.
+            line_split (bool, optional): テキストを改行ごとに分割して生成するかどうか (True の場合 given_phone/given_tone は無視される). Defaults to DEFAULT_LINE_SPLIT.
+            split_interval (float, optional): 改行ごとに分割する場合の無音 (秒). Defaults to DEFAULT_SPLIT_INTERVAL.
+            assist_text (Optional[str], optional): 感情表現の参照元の補助テキスト. Defaults to None.
+            assist_text_weight (float, optional): 感情表現の補助テキストを適用する強さ. Defaults to DEFAULT_ASSIST_TEXT_WEIGHT.
+            use_assist_text (bool, optional): 音声合成時に感情表現の補助テキストを使用するかどうか. Defaults to False.
+            style (str, optional): 音声スタイル (Neutral, Happy など). Defaults to DEFAULT_STYLE.
+            style_weight (float, optional): 音声スタイルを適用する強さ. Defaults to DEFAULT_STYLE_WEIGHT.
+            styles (list[str], optional): List styles
+            style_weights (list[float], optional): List weights with same order as styles
+            given_phone (Optional[list[int]], optional): 読み上げテキストの読みを表す音素列。指定する場合は given_tone も別途指定が必要. Defaults to None.
+            given_tone (Optional[list[int]], optional): アクセントのトーンのリスト. Defaults to None.
+            pitch_scale (float, optional): ピッチの高さ (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
+            intonation_scale (float, optional): 抑揚の平均からの変化幅 (1.0 から変更すると若干音質が低下する). Defaults to 1.0.
+            null_model_params (Optional[dict[int, NullModelParam]], optional): 推論時に使用するヌルモデルの情報。ONNX 推論では無視される。
+            force_reload_model (bool, optional): モデルを強制的に再ロードするかどうか. Defaults to False.
+        Returns:
+            tuple[int, NDArray[Any]]: サンプリングレートと音声データ (16bit PCM)
+        """
+
+        logger.info(f"Start generating audio data from text:\n{text}")
+        if language != "JP" and self.hyper_parameters.version.endswith("JP-Extra"):
+            raise ValueError(
+                "The model is trained with JP-Extra, but the language is not JP"
+            )
+        if reference_audio_path == "":
+            reference_audio_path = None
+        if assist_text == "" or not use_assist_text:
+            assist_text = None
+
+        # スタイルベクトルを取得
+        if len(styles) != len(style_weights):
+            raise ValueError("styles and style_weights must have the same length")
+        if reference_audio_path is None:
+            if len(styles) == 0:
+                style_id = self.style2id[style]
+                style_vector = self.get_style_vector(style_id, style_weight)
+            else:
+                style_ids = [self.style2id[style_name] for style_name in styles]
+                style_vector = self.get_style_vector_mix(style_ids, style_weights)
+        else:
+            style_vector = self.get_style_vector_from_audio(
+                reference_audio_path, style_weight
+            )
+
+        # PyTorch 推論時
+        start_time = time.time()
+
+        # 通常のテキストから音声を生成
+        if not line_split:
+            audio = infer_triton(
+                text=text,
+                sdp_ratio=sdp_ratio,
+                noise_scale=noise,
+                noise_scale_w=noise_w,
+                length_scale=length,
+                sid=speaker_id,
+                language=language,
+                hps=self.hyper_parameters,
+                assist_text=assist_text,
+                assist_text_weight=assist_text_weight,
+                style_vec=style_vector,
+                given_phone=given_phone,
+                given_tone=given_tone,
+            )
+
+        # 改行ごとに分割して音声を生成
+        else:
+            texts = [t for t in text.split("\n") if t != ""]
+            audios = []
+            for i, t in enumerate(texts):
+                audios.append(
+                    infer_triton(
+                        text=t,
+                        sdp_ratio=sdp_ratio,
+                        noise_scale=noise,
+                        noise_scale_w=noise_w,
+                        length_scale=length,
+                        sid=speaker_id,
+                        language=language,
+                        hps=self.hyper_parameters,
+                        assist_text=assist_text,
+                        assist_text_weight=assist_text_weight,
+                        style_vec=style_vector,
+                    )
+                )
+                if i != len(texts) - 1:
+                    audios.append(np.zeros(int(44100 * split_interval)))
+            audio = np.concatenate(audios)
+
+
+        logger.info(
+            f"Audio data generated successfully ({time.time() - start_time:.2f}s)"
+        )
+
+        if not (pitch_scale == 1.0 and intonation_scale == 1.0):
+            _, audio = adjust_voice(
+                fs=self.hyper_parameters.data.sampling_rate,
+                wave=audio,
+                pitch_scale=pitch_scale,
+                intonation_scale=intonation_scale,
+            )
+        audio = self.convert_to_16_bit_wav(audio)
+        return (self.hyper_parameters.data.sampling_rate, audio)
 
 class TTSModelInfo(BaseModel):
     name: str

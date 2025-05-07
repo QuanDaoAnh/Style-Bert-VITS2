@@ -46,3 +46,4 @@ safetensors.ipynb
 .DS_Store
 playground.ipynb
 playgrounds/
+*.json
