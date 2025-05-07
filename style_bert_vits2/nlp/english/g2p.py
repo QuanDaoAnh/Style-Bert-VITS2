@@ -7,6 +7,8 @@ from style_bert_vits2.nlp import bert_models
 from style_bert_vits2.nlp.english.cmudict import get_dict, get_shortform_dict
 from style_bert_vits2.nlp.symbols import PUNCTUATIONS, SYMBOLS
 
+from style_bert_vits2.triton.client import call_token_triton
+
 
 # Initialize global variables once
 ARPA = {
@@ -142,6 +144,59 @@ def g2p(text: str) -> tuple[list[str], list[int], list[int]]:
 
     return phones, tones, word2ph
 
+def g2p_triton(text: str) -> tuple[list[str], list[int], list[int]]:
+    phones = []
+    tones = []
+    phone_len = []
+    words = __text_to_words_triton(text)
+
+    for word in words:
+        temp_phones, temp_tones = [], []
+        if len(word) > 1 and "'" in word:
+            word = ["".join(word)]
+
+        for w in word:
+            if w in PUNCTUATIONS:
+                temp_phones.append(w)
+                temp_tones.append(0)
+                continue
+            if w.isupper() and w in short_form_dict:
+                phns, tns = __refine_syllables(short_form_dict[w])
+                temp_phones += [__post_replace_ph(i) for i in phns]
+                temp_tones += tns
+            elif w.upper() in eng_dict:
+                phns, tns = __refine_syllables(eng_dict[w.upper()])
+                temp_phones += [__post_replace_ph(i) for i in phns]
+                temp_tones += tns
+            else:
+                phone_list = list(filter(lambda p: p != " ", _g2p(w)))
+                phns, tns = [], []
+                for ph in phone_list:
+                    if ph in ARPA:
+                        ph, tn = __refine_ph(ph)
+                        phns.append(ph)
+                        tns.append(tn)
+                    else:
+                        phns.append(ph)
+                        tns.append(0)
+                temp_phones += [__post_replace_ph(i) for i in phns]
+                temp_tones += tns
+
+        phones += temp_phones
+        tones += temp_tones
+        phone_len.append(len(temp_phones))
+
+    word2ph = []
+    for token, pl in zip(words, phone_len):
+        word_len = len(token)
+        word2ph += __distribute_phone(pl, word_len)
+    phones = ["_"] + phones + ["_"]
+    tones = [0] + tones + [0]
+    word2ph = [1] + word2ph + [1]
+    assert len(phones) == len(tones), text
+    assert len(phones) == sum(word2ph), text
+
+    return phones, tones, word2ph
 
 def __post_replace_ph(ph: str) -> str:
     REPLACE_MAP = {
@@ -221,6 +276,29 @@ def __text_to_words(text: str) -> list[list[str]]:
             words[-1].append(f"{t}")
     return words
 
+def __text_to_words_triton(text: str) -> list[list[str]]:
+    tokens = call_token_triton( text, tokenize="TRUE", language=Languages.EN)[-1]
+    words = []
+    for idx, t in enumerate(tokens):
+        if t.startswith("▁"):
+            words.append([t[1:]])
+        elif t in PUNCTUATIONS:
+            if idx == len(tokens) - 1:
+                words.append([f"{t}"])
+            elif (
+                not tokens[idx + 1].startswith("▁")
+                and tokens[idx + 1] not in PUNCTUATIONS
+            ):
+                if idx == 0:
+                    words.append([])
+                words[-1].append(f"{t}")
+            else:
+                words.append([f"{t}"])
+        else:
+            if idx == 0:
+                words.append([])
+            words[-1].append(f"{t}")
+    return words
 
 if __name__ == "__main__":
     # print(get_dict())

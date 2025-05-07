@@ -12,6 +12,8 @@ from style_bert_vits2.nlp.japanese.mora_list import MORA_KATA_TO_MORA_PHONEMES, 
 from style_bert_vits2.nlp.japanese.normalizer import replace_punctuation
 from style_bert_vits2.nlp.symbols import PUNCTUATIONS
 
+from style_bert_vits2.triton.client import call_token_triton
+
 
 def g2p(
     norm_text: str, use_jp_extra: bool = True, raise_yomi_error: bool = False
@@ -100,6 +102,92 @@ def g2p(
 
     return phones, tones, word2ph, sep_kata_with_joshi
 
+def g2p_triton(
+    norm_text: str, use_jp_extra: bool = True, raise_yomi_error: bool = False
+) -> tuple[list[str], list[int], list[int], list[str]]:
+    """
+    他で使われるメインの関数。`normalize_text()` で正規化された `norm_text` を受け取り、
+    - phones: 音素のリスト（ただし `!` や `,` や `.` など punctuation が含まれうる）
+    - tones: アクセントのリスト、0（低）と1（高）からなり、phones と同じ長さ
+    - word2ph: 正規化済みテキストの各文字に音素が何個割り当てられるかを表すリスト
+    - sep_kata_with_joshi: 単語単位の単語のカタカナ読みのリスト (助詞を直前の単語に連結している)
+    のタプルを返す。
+    ただし `phones` と `tones` の最初と終わりに `_` が入り、応じて `word2ph` の最初と最後に 1 が追加される。
+
+    Args:
+        norm_text (str): 正規化済みテキスト
+        use_jp_extra (bool, optional): False の場合、「ん」の音素を「N」ではなく「n」とする。Defaults to True.
+        raise_yomi_error (bool, optional): False の場合、読めない文字が「'」として発音される。Defaults to False.
+
+    Returns:
+        tuple[list[str], list[int], list[int], list[str]]: 音素のリスト、アクセントのリスト、word2ph のリスト、助詞を連結した読みのリスト
+    """
+
+    # pyopenjtalk のフルコンテキストラベルを使ってアクセントを取り出すと、punctuation の位置が消えてしまい情報が失われてしまう：
+    # 「こんにちは、世界。」と「こんにちは！世界。」と「こんにちは！！！？？？世界……。」は全て同じになる。
+    # よって、まず punctuation 無しの音素とアクセントのリストを作り、
+    # それとは別に pyopenjtalk.run_frontend() で得られる音素リスト（こちらは punctuation が保持される）を使い、
+    # アクセント割当をしなおすことによって punctuation を含めた音素とアクセントのリストを作る。
+
+    # OpenJTalk から NJDFeature のリストを取得
+    njd_features = pyopenjtalk.run_frontend(norm_text)
+
+    # punctuation がすべて消えた、音素とアクセントのタプルのリスト（「ん」は「N」）
+    phone_tone_list_wo_punct = __g2phone_tone_wo_punct(njd_features)
+
+    # sep_text: 単語単位の単語のリスト
+    # sep_kata: 単語単位の単語のカタカナ読みのリスト、読めない文字は raise_yomi_error=True なら例外、False なら読めない文字を「'」として返ってくる
+    # sep_kata_with_joshi: sep_kata と同様だが、助詞を直前の単語に連結している
+    sep_text, sep_kata, sep_kata_with_joshi = text_to_sep_kata(
+        norm_text, njd_features=njd_features, raise_yomi_error=raise_yomi_error
+    )
+
+    # sep_phonemes: 各単語ごとの音素のリストのリスト
+    sep_phonemes = __handle_long([__kata_to_phoneme_list(i) for i in sep_kata])
+
+    # phone_w_punct: sep_phonemes を結合した、punctuation を元のまま保持した音素列
+    phone_w_punct: list[str] = []
+    for i in sep_phonemes:
+        phone_w_punct += i
+
+    # punctuation 無しのアクセント情報を使って、punctuation を含めたアクセント情報を作る
+    phone_tone_list = __align_tones(phone_w_punct, phone_tone_list_wo_punct)
+    # logger.debug(f"phone_tone_list:\n{phone_tone_list}")
+
+    # word2ph は厳密な解答は不可能なので（「今日」「眼鏡」等の熟字訓が存在）、
+    # Bert-VITS2 では、単語単位の分割を使って、単語の文字ごとにだいたい均等に音素を分配する
+
+    # sep_text から、各単語を1文字1文字分割して、文字のリスト（のリスト）を作る
+    sep_tokenized: list[list[str]] = []
+    for i in sep_text:
+        if i not in PUNCTUATIONS:
+            sep_tokenized.append(
+                call_token_triton( i, tokenize="TRUE", language=Languages.JP)[-1]
+            )  # ここでおそらく`i`が文字単位に分割される
+        else:
+            sep_tokenized.append([i])
+
+    # 各単語について、音素の数と文字の数を比較して、均等っぽく分配する
+    word2ph = []
+    for token, phoneme in zip(sep_tokenized, sep_phonemes):
+        phone_len = len(phoneme)
+        word_len = len(token)
+        word2ph += __distribute_phone(phone_len, word_len)
+
+    # 最初と最後に `_` 記号を追加、アクセントは 0（低）、word2ph もそれに合わせて追加
+    phone_tone_list = [("_", 0)] + phone_tone_list + [("_", 0)]
+    word2ph = [1] + word2ph + [1]
+
+    phones = [phone for phone, _ in phone_tone_list]
+    tones = [tone for _, tone in phone_tone_list]
+
+    assert len(phones) == sum(word2ph), f"{len(phones)} != {sum(word2ph)}"
+
+    # use_jp_extra でない場合は「N」を「n」に変換
+    if not use_jp_extra:
+        phones = [phone if phone != "N" else "n" for phone in phones]
+
+    return phones, tones, word2ph, sep_kata_with_joshi
 
 def text_to_sep_kata(
     norm_text: str,
