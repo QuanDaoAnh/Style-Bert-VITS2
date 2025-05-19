@@ -25,11 +25,12 @@ mlce-tts-triton-models
 ├── model_repository
 │   ├── model_1.tar.gz
 ```
-5. Model structure
+5. Model structure example
+- Link: style_bert_vits2/sagemaker/model_repository/fastlabel_male_angry_jp
 ```
-model_1
+fastlabel_male_angry_jp
 ├──pipeline
-│   ├──1
+│   ├──1 # must have
 │   ├──config.pbtxt
 ├──bert_jp
 │   ├──1
@@ -39,11 +40,11 @@ model_1
 ├──tts_jp
 │   ├──1
 │   │   ├──model.py
-│   │   ├──model.safetensors
+│   │   ├──model.safetensors # weight of model
 │   │   ├──triton_python_backend_utils.py
 │   ├──config.json
 │   ├──config.pbtxt
-│   ├──style_vectors.npy
+│   ├──style_vectors.npy # style vectors file of model
 ```
 
 # Run code
