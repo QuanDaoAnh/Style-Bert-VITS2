@@ -26,6 +26,9 @@ from style_bert_vits2.logging import logger
 from style_bert_vits2.models.hyper_parameters import HyperParameters
 from style_bert_vits2.voice import adjust_voice
 
+import boto3
+import json
+import torch
 
 if TYPE_CHECKING:
     from style_bert_vits2.models.models import SynthesizerTrn
@@ -787,3 +790,267 @@ class TTSModelHolder:
             gr.Dropdown(choices=initial_model_files, value=initial_model_files[0]),
             gr.Button(interactive=False),  # For tts_button
         )
+
+class TTSModelSageMaker:
+    def __init__(
+        self,
+        config_path: Union[Path, HyperParameters],
+        device: str = "cpu",
+    ) -> None:
+        # ハイパーパラメータの Pydantic モデルが直接指定された
+        if isinstance(config_path, HyperParameters):
+            self.config_path: Path = Path("")  # 互換性のため空の Path を設定
+            self.hyper_parameters: HyperParameters = config_path
+        # ハイパーパラメータのパスが指定された
+        else:
+            self.config_path: Path = config_path
+            self.hyper_parameters: HyperParameters = HyperParameters.load_from_json(
+                self.config_path
+            )
+
+        self.device: str = device
+        self.spk2id: dict[str, int] = self.hyper_parameters.data.spk2id
+        self.id2spk: dict[int, str] = {v: k for k, v in self.spk2id.items()}
+
+        num_styles: int = self.hyper_parameters.data.num_styles
+        if hasattr(self.hyper_parameters.data, "style2id"):
+            self.style2id: dict[str, int] = self.hyper_parameters.data.style2id
+        else:
+            self.style2id: dict[str, int] = {str(i): i for i in range(num_styles)}
+        if len(self.style2id) != num_styles:
+            raise ValueError(
+                f"Number of styles ({num_styles}) does not match the number of style2id ({len(self.style2id)})"
+            )
+        
+    def create_input(self, name: str, data: Any, datatype: str, list_str: bool = False) -> Optional[dict[str, Any]]:
+        if data is None:
+            return None
+        if list_str:
+            data = np.array([list(text.encode('utf-8')) for text in data], dtype=np.object_)
+            datatype = 'INT64'
+        elif isinstance(data, str):
+            data = np.array([list(data.encode('utf-8'))], dtype=np.object_)
+            datatype = 'INT64'
+        elif isinstance(data, float):
+            data = np.array([data], dtype=np.float32)
+        elif isinstance(data, int):
+            data = np.array([data], dtype=np.int64)
+        elif isinstance(data, list):
+            data = np.array(data)
+        elif isinstance(data, torch.Tensor):
+            data = data.detach().cpu().numpy()
+        elif isinstance( data, np.ndarray):
+            data = data
+        if data.shape[0] == 0:
+            return None
+        return {
+            'name': name,
+            'shape': list(data.shape),
+            'datatype': datatype,
+            'data': data.tolist()
+        }
+    
+    def get_style_vector_from_audio(
+        self, audio_path: str
+    ) -> NDArray[Any]:
+        """
+        音声からスタイルベクトルを推論する。
+
+        Args:
+            audio_path (str): 音声ファイルのパス
+            weight (float, optional): スタイルベクトルの重み. Defaults to 1.0.
+        Returns:
+            NDArray[Any]: スタイルベクトル
+        """
+
+        if self.style_vector_inference is None:
+
+            # pyannote.audio は scikit-learn などの大量の重量級ライブラリに依存しているため、
+            # TTSModel.infer() に reference_audio_path を指定し音声からスタイルベクトルを推論する場合のみ遅延 import する
+            try:
+                import pyannote.audio
+            except ImportError:
+                raise ImportError(
+                    "pyannote.audio is required to infer style vector from audio"
+                )
+
+            # スタイルベクトルを取得するための推論モデルを初期化
+            import torch
+
+            self.style_vector_inference = pyannote.audio.Inference(
+                model=pyannote.audio.Model.from_pretrained(
+                    "pyannote/wespeaker-voxceleb-resnet34-LM"
+                ),
+                window="whole",
+            )
+            self.style_vector_inference.to(torch.device(self.device))
+
+        # 音声からスタイルベクトルを推論
+        xvec = self.style_vector_inference(audio_path)
+        return np.array(xvec)
+
+    @staticmethod
+    def convert_to_16_bit_wav(data: NDArray[Any]) -> NDArray[Any]:
+        """
+        音声データを 16-bit int 形式に変換する。
+        gradio.processing_utils.convert_to_16_bit_wav() を移植したもの。
+
+        Args:
+            data (NDArray[Any]): 音声データ
+
+        Returns:
+            NDArray[Any]: 16-bit int 形式の音声データ
+        """
+
+        # Based on: https://docs.scipy.org/doc/scipy/reference/generated/scipy.io.wavfile.write.html
+        if data.dtype in [np.float64, np.float32, np.float16]:  # type: ignore
+            data = data / np.abs(data).max()
+            data = data * 32767
+            data = data.astype(np.int16)
+        elif data.dtype == np.int32:
+            data = data / 65536
+            data = data.astype(np.int16)
+        elif data.dtype == np.int16:
+            pass
+        elif data.dtype == np.uint16:
+            data = data - 32768
+            data = data.astype(np.int16)
+        elif data.dtype == np.uint8:
+            data = data * 257 - 32768
+            data = data.astype(np.int16)
+        elif data.dtype == np.int8:
+            data = data * 256
+            data = data.astype(np.int16)
+        else:
+            raise ValueError(
+                "Audio data cannot be converted automatically from "
+                f"{data.dtype} to 16-bit int format."
+            )
+
+        return data
+
+    def infer(
+        self, 
+        text: str,
+        skip_start: bool = True,
+        skip_end: bool = True,
+        language: Languages = Languages.JP,
+        speaker_id: int = 0,
+        reference_audio_path: Optional[str] = None,
+        sdp_ratio: float = DEFAULT_SDP_RATIO,
+        noise: float = DEFAULT_NOISE,
+        noise_w: float = DEFAULT_NOISEW,
+        length: float = DEFAULT_LENGTH,
+        line_split: bool = DEFAULT_LINE_SPLIT,
+        split_interval: float = DEFAULT_SPLIT_INTERVAL,
+        assist_text: Optional[str] = None,
+        assist_text_weight: float = DEFAULT_ASSIST_TEXT_WEIGHT,
+        use_assist_text: bool = False,
+        style: str = DEFAULT_STYLE,
+        style_weight: float = DEFAULT_STYLE_WEIGHT,
+        styles: list[str] = [],
+        style_weights: list[float] = [],
+        given_phone: Optional[list[str]] = None,
+        given_tone: Optional[list[int]] = None,
+        pitch_scale: float = 1.0,
+        intonation_scale: float = 1.0,
+    ) -> tuple[int, NDArray[Any]]:
+        
+        logger.info(f"Start generating audio data from text:\n{text}")
+        if language != "JP" and self.hyper_parameters.version.endswith("JP-Extra"):
+            raise ValueError(
+                "The model is trained with JP-Extra, but the language is not JP"
+            )
+        if reference_audio_path == "":
+            reference_audio_path = None
+        if assist_text == "" or not use_assist_text:
+            assist_text = None
+
+        if reference_audio_path is not None:
+            style_vector = self.get_style_vector_from_audio(
+                reference_audio_path
+            )
+        else:
+            style_vector = None
+
+        start_time = time.time()
+        #Create input
+        add_blank = 1 if self.hyper_parameters.data.add_blank else 0
+        inputs_pipeline = [
+            self.create_input( "VERSION", self.hyper_parameters.version, "STRING"),
+            self.create_input( "ASSIST_TEXT", assist_text, "STRING"),
+            self.create_input( "ASSIST_TEXT_WEIGHT", assist_text_weight, "FP32"),
+            self.create_input( "GIVEN_PHONE", given_phone, "STRING", list_str=True),
+            self.create_input( "GIVEN_TONE", given_tone, "INT64"),
+            self.create_input( "ADD_BLANK", add_blank, "INT64"),
+            self.create_input( "SKIP_START", skip_start, "INT64"),
+            self.create_input( "SKIP_END", skip_end, "INT64"),
+            self.create_input( "SID", speaker_id, "INT64"),
+            self.create_input( "STYLE_VEC", style_vector, "FP32"),
+            self.create_input( "STYLE", style, "STRING"),
+            self.create_input( "STYLE_WEIGHT", style_weight, "FP32"),
+            self.create_input( "STYLES", styles, "STRING", list_str=True),
+            self.create_input( "STYLE_WEIGHTS", style_weights, "FP32"),
+            self.create_input( "SDP_RATIO", sdp_ratio, "FP32"),
+            self.create_input( "NOISE_SCALE", noise, "FP32"),
+            self.create_input( "NOISE_SCALE_W", noise_w, "FP32"),
+            self.create_input( "LENGTH_SCALE", length, "FP32"),
+        ]
+
+        #Infer
+        runtime_client = boto3.client('sagemaker-runtime', region_name='ap-northeast-1')
+        # 通常のテキストから音声を生成
+        if not line_split:
+            text_input = self.create_input( "TEXT", text, "STRING")
+            inputs_pipeline.append(text_input)
+            inputs_pipeline = list( filter( lambda x: x is not None, inputs_pipeline))
+            payload = {
+                    'inputs': list(inputs_pipeline)
+                }
+            response = runtime_client.invoke_endpoint(
+                EndpointName='mlce-tts-triton-endpoint',
+                ContentType='application/json',
+                TargetModel=f'{self.hyper_parameters.model_name}.tar.gz',
+                Body=json.dumps(payload)
+            )
+            result = json.loads(response['Body'].read().decode())
+            result_array = np.array(result['outputs'][0]['data'])
+            result_shape = result['outputs'][0]['shape']
+            audio = result_array.reshape( result_shape)
+        else:
+            texts = [t for t in text.split("\n") if t != ""]
+            audios = []
+            for i, t in enumerate(texts):
+                inputs_tmp = inputs_pipeline.copy()
+                text_input = self.create_input( "TEXT", t, "STRING")
+                inputs_tmp.append(text_input)
+                inputs_tmp = list( filter( lambda x: x is not None, inputs_tmp))
+                payload = {
+                        'inputs': list(inputs_tmp)
+                    }
+                response = runtime_client.invoke_endpoint(
+                    EndpointName='mlce-tts-triton-endpoint',
+                    ContentType='application/json',
+                    TargetModel=f'{self.hyper_parameters.model_name}.tar.gz',
+                    Body=json.dumps(payload)
+                )
+                result = json.loads(response['Body'].read().decode())
+                result_array = np.array(result['outputs'][0]['data'])
+                result_shape = result['outputs'][0]['shape']
+                audios.append(result_array.reshape( result_shape))
+                if i != len(texts) - 1:
+                    audios.append(np.zeros(int(44100 * split_interval)))
+            audio = np.concatenate(audios)
+        logger.info(
+            f"Audio data generated successfully ({time.time() - start_time:.2f}s)"
+        )
+
+        if not (pitch_scale == 1.0 and intonation_scale == 1.0):
+            _, audio = adjust_voice(
+                fs=self.hyper_parameters.data.sampling_rate,
+                wave=audio,
+                pitch_scale=pitch_scale,
+                intonation_scale=intonation_scale,
+            )
+        audio = self.convert_to_16_bit_wav(audio)
+        return (self.hyper_parameters.data.sampling_rate, audio)

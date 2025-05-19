@@ -5,7 +5,6 @@ TODO: server_editor.pyと統合する?
 
 import argparse
 import os
-import sys
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional
@@ -34,14 +33,15 @@ from style_bert_vits2.constants import (
     Languages,
 )
 from style_bert_vits2.logging import logger
-from style_bert_vits2.nlp import bert_models, onnx_bert_models
+from style_bert_vits2.nlp.chinese.normalizer import normalize_text
 from style_bert_vits2.nlp.japanese import pyopenjtalk_worker as pyopenjtalk
+from style_bert_vits2.nlp.japanese.g2p_utils import g2kata_tone
 from style_bert_vits2.nlp.japanese.user_dict import update_dict
-from style_bert_vits2.tts_model import TTSModel, TTSModelHolder
-from style_bert_vits2.utils import torch_device_to_onnx_providers
+from style_bert_vits2.tts_model import TTSModelSageMaker
 
 
 config = get_config()
+model_dir = config.assets_root
 ln = config.server_config.language
 
 
@@ -65,23 +65,21 @@ class AudioResponse(Response):
     media_type = "audio/wav"
 
 
-loaded_models: list[TTSModel] = []
+loaded_models: list[TTSModelSageMaker] = []
 
 
-def load_models(model_holder: TTSModelHolder):
+def load_models(models_dir: Path):
     global loaded_models
     loaded_models = []
-    for model_name, model_paths in model_holder.model_files_dict.items():
-        model = TTSModel(
-            model_path=model_paths[0],
-            config_path=model_holder.root_dir / model_name / "config.json",
-            style_vec_path=model_holder.root_dir / model_name / "style_vectors.npy",
-            device=model_holder.device,
+    model_names = [name for name in os.listdir( models_dir) if name != '.gitignore']
+    for model_name in model_names:
+        model = TTSModelSageMaker(
+            config_path=models_dir / model_name / "config.json",
+            device="cuda",
         )
         # 起動時に全てのモデルを読み込むのは時間がかかりメモリを食うのでやめる
         # model.load()
         loaded_models.append(model)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -97,28 +95,8 @@ if __name__ == "__main__":
     else:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 事前に BERT モデル/トークナイザーをロードしておく
-    ## ここでロードしなくても必要になった際に自動ロードされるが、時間がかかるため事前にロードしておいた方が体験が良い
-    ## 英語や中国語で音声合成するユースケースは限られていることから、VRAM 節約のため日本語の BERT モデル/トークナイザーのみロードする
-    bert_models.load_model(Languages.JP, device_map=device)
-    bert_models.load_tokenizer(Languages.JP)
-    # VRAM 節約のため、既定では ONNX 版 BERT モデル/トークナイザーは事前ロードしない
-    if args.preload_onnx_bert:
-        onnx_bert_models.load_model(
-            Languages.JP, onnx_providers=torch_device_to_onnx_providers(device)
-        )
-        onnx_bert_models.load_tokenizer(Languages.JP)
-
-    model_dir = Path(args.dir)
-    model_holder = TTSModelHolder(
-        model_dir, device, torch_device_to_onnx_providers(device)
-    )
-    if len(model_holder.model_names) == 0:
-        logger.error(f"Models not found in {model_dir}.")
-        sys.exit(1)
-
     logger.info("Loading models...")
-    load_models(model_holder)
+    load_models(args.dir)
 
     limit = config.server_config.limit
     if limit < 1:
@@ -205,7 +183,7 @@ if __name__ == "__main__":
                 "The GET method is not recommended for this endpoint due to various restrictions. Please use the POST method."
             )
         if model_id >= len(
-            model_holder.model_names
+            loaded_models
         ):  # /models/refresh があるためQuery(le)で表現不可
             raise_validation_error(f"model_id={model_id} not found", "model_id")
 
@@ -213,8 +191,8 @@ if __name__ == "__main__":
             # load_models() の 処理内容が i の正当性を担保していることに注意
             model_ids = [
                 i
-                for i, x in enumerate(model_holder.models_info)
-                if x.name == model_name
+                for i, x in enumerate(loaded_models)
+                if x.hyper_parameters.model_name == model_name
             ]
             if not model_ids:
                 raise_validation_error(
@@ -277,20 +255,16 @@ if __name__ == "__main__":
         result: dict[str, dict[str, Any]] = dict()
         for model_id, model in enumerate(loaded_models):
             result[str(model_id)] = {
+                "model_name": model.hyper_parameters.model_name,
                 "config_path": model.config_path,
-                "model_path": model.model_path,
                 "device": model.device,
-                "spk2id": model.spk2id,
-                "id2spk": model.id2spk,
-                "style2id": model.style2id,
             }
         return result
 
     @app.post("/models/refresh")
     def refresh():
         """モデルをパスに追加/削除した際などに読み込ませる"""
-        model_holder.refresh()
-        load_models(model_holder)
+        load_models(model_dir)
         return get_loaded_models_info()
 
     @app.get("/status")

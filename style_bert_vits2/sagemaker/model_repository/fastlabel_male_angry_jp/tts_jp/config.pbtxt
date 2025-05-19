@@ -1,0 +1,131 @@
+name: "tts_jp"
+backend: "python"
+max_batch_size: 0
+
+input [
+  {
+    name: "X"
+    data_type: TYPE_INT64
+    dims: [ 1, -1 ]
+  },
+  {
+    name: "SID"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+  },
+  {
+    name: "TONE"
+    data_type: TYPE_INT64
+    dims: [ 1, -1 ]
+  },
+  {
+    name: "LANGUAGE"
+    data_type: TYPE_INT64
+    dims: [ 1, -1 ]
+  },
+  {
+    name: "BERT"
+    data_type: TYPE_FP32
+    dims: [ 1, 1024, -1 ]
+  },
+  {
+    name: "JA_BERT"
+    data_type: TYPE_FP32
+    dims: [ 1, 1024, -1 ]
+  },
+  {
+    name: "EN_BERT"
+    data_type: TYPE_FP32
+    dims: [ 1, 1024, -1 ]
+  },
+  {
+    name: "STYLE_VEC"
+    data_type: TYPE_FP32
+    dims: [ 1, 256 ]
+    optional: true
+  },
+  {
+    name: "STYLE"
+    data_type: TYPE_INT64
+    dims: [ 1, -1 ]
+    optional: true
+  },
+  {
+    name: "STYLE_WEIGHT"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "STYLES"
+    data_type: TYPE_INT64
+    dims: [ -1, -1 ]
+    optional: true
+  },
+  {
+    name: "STYLE_WEIGHTS"
+    data_type: TYPE_FP32
+    dims: [ -1 ]
+    optional: true
+  },
+  {
+    name: "NOISE_SCALE"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "LENGTH_SCALE"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "NOISE_SCALE_W"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "MAX_LEN"
+    data_type: TYPE_INT64
+    dims: [ 1 ]
+    optional: true
+  },
+  {
+    name: "SDP_RATIO"
+    data_type: TYPE_FP32
+    dims: [ 1 ]
+  },
+  {
+    name: "Y"
+    data_type: TYPE_INT64
+    dims: [ -1 ]
+    optional: true
+  },
+  {
+    name: "VERSION"
+    data_type: TYPE_INT64
+    dims: [ 1, -1 ]
+  }
+]
+
+output [
+  {
+    name: "AUDIO"
+    data_type: TYPE_FP32
+    dims: [ -1, -1 ]
+  }
+]
+
+parameters: {
+  key: "config_path",
+  value: {string_value: "config.json"}
+}
+
+parameters: {
+  key: "model_file",
+  value: {string_value: "model.safetensors"}
+}
+
+parameters: {
+  key: "style_vec_path",
+  value: {string_value: "style_vectors.npy"}
+}
