@@ -1,10 +1,13 @@
 # Requirements
 1. Needed role for EC2
+- if run server in EC2 - else use key for access to SageMaker
 - AmazonSageMakerFullAccess
+- IAMFullAccess
 - Must to connect EC2 by root
-2. Role for model in sagemaker
-- Create default
-- need S3Access
+2. Role for SageMaker
+- AmazonSageMakerFullAccess
+- AmazoneS3FullAccess
+- Create role by code in file [create_sagemaker.py](style_bert_vits2/sagemaker/create_sagemaker.py)
 3. ECR image
 - use custom ECR:
 ```
@@ -26,7 +29,7 @@ mlce-tts-triton-models
 │   ├── model_1.tar.gz
 ```
 5. Model structure example
-- Link: style_bert_vits2/sagemaker/model_repository/fastlabel_male_angry_jp
+- Link: [fastlabel_male_angry_jp](style_bert_vits2/sagemaker/model_repository/fastlabel_male_angry_jp)
 ```
 fastlabel_male_angry_jp
 ├──pipeline
@@ -48,7 +51,7 @@ fastlabel_male_angry_jp
 ```
 
 # Run code
-1. Create sagemaker endpoint
+1. Create sagemaker role, model, endpoint config, endpoint
 ```
 python style_bert_vits2/sagemaker/create_sagemaker.py
 ```
