@@ -12,13 +12,13 @@
 ```
 - image template
 ```
-FROM <aws_account_id>.dkr.ecr.ap-northeast-1.amazonaws.com/sagemaker-tritonserver:23.10-py3
+FROM <aws_account_id>.dkr.ecr.<region>.amazonaws.com/sagemaker-tritonserver:23.10-py3
 
 RUN pip install style-bert-vits2 protobuf==4.25 accelerate
 RUN pip install hf_xet
 RUN pip install sentencepiece
 ```
-- aws_account_id based on: [Here](https://docs.aws.amazon.com/en_jp/sagemaker/latest/dg/neo-deployment-hosting-services-container-images.html)
+- **aws_account_id** and **region** based on: [Here](https://docs.aws.amazon.com/en_jp/sagemaker/latest/dg/neo-deployment-hosting-services-container-images.html)
 4. S3 bucket structure
 ```
 mlce-tts-triton-models
